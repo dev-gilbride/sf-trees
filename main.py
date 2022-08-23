@@ -2,26 +2,46 @@ import asyncio
 import argparse
 import geopandas as gpd
 from geopy.adapters import AioHTTPAdapter
+import geopy.geocoders
 from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 import json
+import logging
 import pandas as pd
 from shapely.geometry import Point
 import urllib.request
 
 
 async def get_address_coords(address: str) -> dict:
+    """Retrieves latitude, longitude coordinates from Open Street Map (Nominatim)."""
+
+    geopy.geocoders.options.default_timeout = 3
     async with Nominatim(
         user_agent="tree_radius",
         adapter_factory=AioHTTPAdapter,
     ) as geolocator:
-        location = await geolocator.geocode(address)
-        return {
-            "Latitude": location.latitude,
-            "Longitude": location.longitude
-        }
+        attempts = 0
+        while attempts < 3:
+            try:
+                location = await geolocator.geocode(address)
+                return {
+                    "Latitude": location.latitude,
+                    "Longitude": location.longitude
+                }
+            except (geopy.exc.GeocoderTimedOut, 
+                    geopy.exc.GeocoderUnavailable,
+                    geopy.exc.GeocoderServiceError, 
+                    geopy.exc.GeocoderQuotaExceeded) as err:
+                logging.warning(f'Attempt {attempts + 1} failed with error: {err}')
+                attempts += 1
+        raise ConnectionError(f'Failed to retrieve coordinates for the address.')
 
 
 def get_sf_tree_data(page_size: int, offset: int = 0):
+    """Queries the sf-trees datasette for a page of entries with offset."""
+
+    SF_TREES_URL = "https://san-francisco.datasettes.com/sf-trees"
+
     query = ("select rowid, TreeID, qLegalStatus, qSpecies, qAddress, SiteOrder, qSiteInfo, PlantType, qCaretaker, qCareAssistant, PlantDate, "
              "DBH, PlotSize, PermitNotes, XCoord, YCoord, Latitude, Longitude, Location from Street_Tree_List order by rowid limit "
              f'{page_size}'
@@ -29,21 +49,26 @@ def get_sf_tree_data(page_size: int, offset: int = 0):
     if offset:
         query = query + f' offset {offset}'
     query = urllib.parse.quote_plus(query)
-    url = f'https://san-francisco.datasettes.com/sf-trees.json?sql={query}'
-    print(f'Obtaining: {url}')
+    url = SF_TREES_URL + '.json?sql=' + query
+    logging.debug(f'Obtaining query: {url}')
     req = urllib.request.Request(
         url,
         data=None,
+        # Adds user headers to avoid automated rate limiting.
         headers={
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
         }
     )
     with urllib.request.urlopen(req) as response:
+        if response.status != 200:
+            raise urllib.error.URLError(f'Query returned a bad reponse: {response.status}')
         data = json.load(response)
         return data
 
 
 def filter_by_proximity(center: dict, radius: float, data: dict):
+    """Converts data into a GeoDataFrame and returns entries within radius distance of the center."""
+    
     df = pd.DataFrame(data["rows"])
     df = df.rename(columns={0: "rowid", 1: "TreeID", 2: "qLegalStatus", 3: "qSpecies", 4: "qAddress", 5: "SiteOrder", 6: "qSiteInfo",
                             7: "PlantType", 8: "qCaretaker", 9: "qCareAssistant", 10: "PlantDate", 11: "DBH", 12: "PlotSize", 13: "PermitNotes",
@@ -61,7 +86,6 @@ def filter_by_proximity(center: dict, radius: float, data: dict):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(description="Find trees with a block radius of given address.")
     parser.add_argument("--address", type=str, help="Address to center the search around.")
     parser.add_argument("--blocks", type=int, help="Number of blocks to extend search radius.")
@@ -81,7 +105,7 @@ if __name__ == "__main__":
             offset += args.page_size
             trees = filter_by_proximity(center_coordinates, radius, data)
             trees_to_add.append(trees)
-            print(f'Trees appended: {len(trees_to_add)}')
+            logging.debug(f'DataFrames appended: {len(trees_to_add)}')
         else:
             break
     trees_in_range = pd.concat(trees_to_add)
