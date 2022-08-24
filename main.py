@@ -4,12 +4,12 @@ import geopandas as gpd
 from geopy.adapters import AioHTTPAdapter
 import geopy.geocoders
 from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 import json
 import logging
 import pandas as pd
 from shapely.geometry import Point
 import urllib.request
+import socket
 
 
 async def get_address_coords(address: str) -> dict:
@@ -28,13 +28,13 @@ async def get_address_coords(address: str) -> dict:
                     "Latitude": location.latitude,
                     "Longitude": location.longitude
                 }
-            except (geopy.exc.GeocoderTimedOut, 
+            except (geopy.exc.GeocoderTimedOut,
                     geopy.exc.GeocoderUnavailable,
-                    geopy.exc.GeocoderServiceError, 
+                    geopy.exc.GeocoderServiceError,
                     geopy.exc.GeocoderQuotaExceeded) as err:
                 logging.warning(f'Attempt {attempts + 1} failed with error: {err}')
                 attempts += 1
-        raise ConnectionError(f'Failed to retrieve coordinates for the address.')
+        raise ConnectionError("Failed to retrieve coordinates for the address.")
 
 
 def get_sf_tree_data(page_size: int, offset: int = 0):
@@ -54,21 +54,30 @@ def get_sf_tree_data(page_size: int, offset: int = 0):
     req = urllib.request.Request(
         url,
         data=None,
-        # Adds user headers to avoid automated rate limiting.
+        # Adds user headers to avoid rate limiting.
         headers={
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
         }
     )
-    with urllib.request.urlopen(req) as response:
-        if response.status != 200:
-            raise urllib.error.URLError(f'Query returned a bad reponse: {response.status}')
-        data = json.load(response)
-        return data
+    attempts = 0
+    while attempts < 5:
+        try:
+            with urllib.request.urlopen(req, timeout=3) as response:
+                if response.status != 200:
+                    raise urllib.error.URLError(f'Query returned a bad reponse status: {response.status}')
+                data = json.load(response)
+                return data
+        except (socket.timeout,
+                urllib.error.urlerror,
+                urllib.error.HTTPError) as err:
+            logging.warning(f'Attempt {attempts + 1} failed with error: {err}')
+            attempts += 1
+        raise ConnectionError(f'Failed to retrieve url: {url}')
 
 
 def filter_by_proximity(center: dict, radius: float, data: dict):
     """Converts data into a GeoDataFrame and returns entries within radius distance of the center."""
-    
+
     df = pd.DataFrame(data["rows"])
     df = df.rename(columns={0: "rowid", 1: "TreeID", 2: "qLegalStatus", 3: "qSpecies", 4: "qAddress", 5: "SiteOrder", 6: "qSiteInfo",
                             7: "PlantType", 8: "qCaretaker", 9: "qCareAssistant", 10: "PlantDate", 11: "DBH", 12: "PlotSize", 13: "PermitNotes",
@@ -77,6 +86,7 @@ def filter_by_proximity(center: dict, radius: float, data: dict):
         df,
         geometry=gpd.points_from_xy(
             df.Longitude, df.Latitude, crs="EPSG:4326"))
+    logging.debug(f'GeoDataFrame entry count: {len(gdf.index)}')
     center_point = Point(center['Longitude'], center['Latitude'])
     center_point_geodetic = gpd.GeoSeries([center_point], crs="EPSG:4326")
     center_point_cartesian = center_point_geodetic.to_crs(crs="EPSG:3857").iloc[0]
@@ -91,8 +101,13 @@ if __name__ == "__main__":
     parser.add_argument("--blocks", type=int, help="Number of blocks to extend search radius.")
     parser.add_argument("--block-length", required=False, default=182.88, type=float,
                         help="Length in meters to measure a block. Defaults to US average of 182.88m.")
-    parser.add_argument("--page-size", required=False, default=10000, type=int, help="Number of database entries per request. Defaults to 10000.")
+    parser.add_argument("--page-size", required=False, choices=range(100,1000), default=1000, type=int, metavar="[100-1000]", 
+                        help="Number of database entries per request up to 1000. Defaults to 1000.")
+    parser.add_argument("--logging", required=False, default='info', type=str, help="Logging mode. Defaults to INFO.")
     args = parser.parse_args()
+
+    logging_level = getattr(logging, args.logging.upper(), None)
+    logging.basicConfig(level=logging_level)
 
     center_coordinates = asyncio.run(get_address_coords(args.address))
 
@@ -102,8 +117,10 @@ if __name__ == "__main__":
     while True:  # Do While Loop
         data = get_sf_tree_data(args.page_size, offset)
         if len(data["rows"]) > 0:
+            logging.debug(f'Data entry count: {len(data["rows"])}')
             offset += args.page_size
             trees = filter_by_proximity(center_coordinates, radius, data)
+            logging.debug(f'Filtered data count: {len(trees.index)}')
             trees_to_add.append(trees)
             logging.debug(f'DataFrames appended: {len(trees_to_add)}')
         else:
@@ -116,3 +133,4 @@ if __name__ == "__main__":
     print(f'Centered around address: {args.address}')
     if len(trees_in_range.index) > 0:
         print(trees_in_range)
+        trees_in_range.to_csv(f'{args.page_size}_trees.csv', index=False)

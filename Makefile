@@ -1,19 +1,21 @@
-build: requirements.txt
+.PHONY: venv
+
+build: init setup start
+
+init:
 	python3 -m venv venv
-	. venv/bin/activate
-	pip install -r requirements.txt
 
-lint: .flake8
-	. venv/bin/activate
-	flake8
+setup: requirements.txt venv
+	. venv/bin/activate; pip install -r requirements.txt
 
-start:
-	. venv/bin/activate
-	python main.py --blocks=5 --address="747 Howard St, San Francisco, CA 94103"
+lint: .flake8 venv
+	. venv/bin/activate; flake8
 
-debug:
-	. venv/bin/activate
-	python main.py --blocks=5 --address="747 Howard St, San Francisco, CA 94103" --logging=debug
+start: venv
+	. venv/bin/activate; python main.py --blocks=5 --address="747 Howard St, San Francisco, CA 94103"
 
-clean: 
+debug: venv
+	. venv/bin/activate; python main.py --blocks=5 --address="747 Howard St, San Francisco, CA 94103" --logging=debug
+
+clean: venv
 	rm -rf venv
