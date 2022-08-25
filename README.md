@@ -51,10 +51,3 @@ Removes the virtual environment venv.
 ```
 make clean
 ```
-
-## Command Line Arguments
-For argument usage information run:
-
-```
-python main.py -h
-```
